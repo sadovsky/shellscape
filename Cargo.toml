@@ -1,0 +1,30 @@
+[package]
+name = "shellscape"
+version = "0.1.0"
+edition = "2021"
+authors = ["Alex Sadovsky"]
+description = "A terminal-based web browser with ASCII graphics"
+license = "MIT"
+
+[[bin]]
+name = "shellscape"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "deflate", "brotli"] }
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
+url = "2.5"
+unicode-width = "0.2"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+textwrap = "0.16"
+mime = "0.3"
+tempfile = "3"
