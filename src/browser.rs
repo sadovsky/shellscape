@@ -21,7 +21,14 @@ pub enum LineType {
     CodeBlock,
     BlockQuote,
     ListItem(u8),
-    ImagePlaceholder { chafa_output: Option<String>, alt: String, src: String },
+    /// A placeholder for an image that may not have been rendered yet.
+    /// `image_id` is unique within the page and used to find this line when
+    /// the async render task completes — even if prior splices shifted indices.
+    ImagePlaceholder {
+        image_id: usize,
+        alt: String,
+        src: String,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -33,7 +33,13 @@ pub enum AppEvent {
     Tick,
     FetchComplete { tab_id: usize, result: FetchResult },
     FetchError { tab_id: usize, error: String },
-    ImageRendered { line_idx: usize, tab_id: usize, output: String },
+    /// Async image render completed. `image_id` uniquely identifies the
+    /// placeholder within the page; `lines` are the parsed styled rows.
+    ImageRendered {
+        image_id: usize,
+        tab_id: usize,
+        lines: Vec<crate::browser::StyledLine>,
+    },
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -187,13 +193,31 @@ impl App {
                 }
                 self.is_dirty = true;
             }
-            AppEvent::ImageRendered { line_idx, tab_id, output } => {
+            AppEvent::ImageRendered { image_id, tab_id, lines: rendered } => {
                 if let Some(tab) = self.browser.tabs.iter_mut().find(|t| t.id == tab_id) {
                     if let Some(page) = &mut tab.page {
-                        if let Some(line) = page.lines.get_mut(line_idx) {
-                            if let crate::browser::LineType::ImagePlaceholder { chafa_output, .. } = &mut line.line_type {
-                                *chafa_output = Some(output);
+                        // Find the placeholder by image_id (robust to prior splices)
+                        if let Some(ph_idx) = page.lines.iter().position(|l| {
+                            matches!(&l.line_type,
+                                crate::browser::LineType::ImagePlaceholder { image_id: id, .. }
+                                if *id == image_id)
+                        }) {
+                            let n_new = rendered.len();
+                            // Replace the single placeholder with N rendered rows
+                            page.lines.splice(ph_idx..ph_idx + 1, rendered);
+
+                            // Adjust link line_indices for the inserted rows
+                            let delta = n_new as isize - 1;
+                            if delta != 0 {
+                                for link in &mut page.links {
+                                    if link.line_idx > ph_idx {
+                                        link.line_idx =
+                                            (link.line_idx as isize + delta).max(0) as usize;
+                                    }
+                                }
                             }
+
+                            tab.scroll.total_lines = page.lines.len();
                         }
                     }
                 }
@@ -433,32 +457,38 @@ impl App {
         };
         let Some(page) = &tab.page else { return; };
 
-        let image_tasks: Vec<(usize, String)> = page.lines.iter().enumerate()
-            .filter_map(|(i, line)| {
-                if let crate::browser::LineType::ImagePlaceholder { src, .. } = &line.line_type {
-                    if !src.is_empty() { Some((i, src.clone())) } else { None }
+        // Collect (image_id, src_url) for every placeholder on this page.
+        let image_tasks: Vec<(usize, String)> = page.lines.iter()
+            .filter_map(|line| {
+                if let crate::browser::LineType::ImagePlaceholder { image_id, src, .. } = &line.line_type {
+                    if !src.is_empty() { Some((*image_id, src.clone())) } else { None }
                 } else {
                     None
                 }
             })
             .collect();
 
-        for (line_idx, src_url) in image_tasks {
+        let col_width = self.viewport_width.max(40);
+        // Image height: half the column width (typical terminal cell is ~2:1 tall:wide),
+        // giving a roughly square image. Capped at 40 rows to avoid flooding the page.
+        let img_height: u16 = (col_width / 2).min(40).max(10);
+
+        for (image_id, src_url) in image_tasks {
             let Ok(url) = Url::parse(&src_url) else { continue; };
             let tx = self.event_tx.clone();
             let client = Arc::clone(&self.http_client);
             let chafa = Arc::clone(&self.chafa);
-            let col_width = self.viewport_width;
 
             tokio::spawn(async move {
                 let bytes = match fetcher::fetch_bytes(&client, url).await {
                     Ok(b) => b,
                     Err(_) => return,
                 };
-                let output = chafa.render_image(&bytes, col_width, 10)
-                    .unwrap_or_default();
-                if !output.is_empty() {
-                    let _ = tx.send(AppEvent::ImageRendered { line_idx, tab_id, output });
+                match chafa.render_image(&bytes, col_width, img_height) {
+                    Ok(lines) if !lines.is_empty() => {
+                        let _ = tx.send(AppEvent::ImageRendered { image_id, tab_id, lines });
+                    }
+                    _ => {} // silently ignore render failures
                 }
             });
         }

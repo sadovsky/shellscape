@@ -42,6 +42,8 @@ struct RenderContext {
     in_pre: bool,
 
     last_was_blank: bool,
+    /// Counter for assigning unique image_ids within a page.
+    next_image_id: usize,
 }
 
 #[derive(Clone)]
@@ -65,6 +67,7 @@ impl RenderContext {
             in_ol: Vec::new(),
             in_pre: false,
             last_was_blank: false,
+            next_image_id: 0,
         }
     }
 
@@ -161,6 +164,8 @@ impl RenderContext {
 
             DomNode::Image(img) => {
                 self.flush_inline();
+                let image_id = self.next_image_id;
+                self.next_image_id += 1;
                 let display_text = if img.alt.is_empty() {
                     format!("[IMG: {}]", truncate_url(&img.src, 40))
                 } else {
@@ -173,7 +178,7 @@ impl RenderContext {
                         link_idx: None,
                     }],
                     line_type: LineType::ImagePlaceholder {
-                        chafa_output: None,
+                        image_id,
                         alt: img.alt.clone(),
                         src: img.src.clone(),
                     },
