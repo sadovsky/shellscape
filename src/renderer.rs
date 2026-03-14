@@ -1,4 +1,5 @@
 use ratatui::style::{Color, Modifier, Style};
+use unicode_width::UnicodeWidthStr;
 use url::Url;
 
 use crate::browser::{LineType, PageLink, RenderedPage, StyledLine, StyledSpan};
@@ -13,7 +14,7 @@ pub fn render(root: &DomNode, base_url: &Url, col_width: u16) -> RenderedPage {
 
     RenderedPage {
         url: base_url.clone(),
-        title: String::new(), // filled in by caller from ParseResult.title
+        title: String::new(),
         lines: ctx.lines,
         links: ctx.links,
         focused_link: None,
@@ -29,29 +30,24 @@ struct RenderContext {
     lines: Vec<StyledLine>,
     links: Vec<PageLink>,
 
-    // Inline span accumulator
     inline_spans: Vec<StyledSpan>,
     current_line_type: LineType,
 
-    // Style stack
     style_stack: Vec<StyleFrame>,
 
-    // List state
     list_depth: u8,
-    list_counters: Vec<usize>, // for ol
+    list_counters: Vec<usize>,
     in_ol: Vec<bool>,
 
-    // Pre/code block
     in_pre: bool,
 
-    // Whether last emitted line was blank (to avoid double blanks)
     last_was_blank: bool,
 }
 
 #[derive(Clone)]
 struct StyleFrame {
     style: Style,
-    is_link: Option<usize>, // link index if inside <a>
+    is_link: Option<usize>,
 }
 
 impl RenderContext {
@@ -95,16 +91,31 @@ impl RenderContext {
         if self.inline_spans.is_empty() { return; }
         let spans = std::mem::take(&mut self.inline_spans);
         let line_type = std::mem::replace(&mut self.current_line_type, LineType::Normal);
-        // Remove leading/trailing space-only spans from normal lines
-        let line = StyledLine { spans, line_type };
-        self.push_line(line);
+
+        // Update col_range for any links in this line
+        let mut col: u16 = 0;
+        for span in &spans {
+            let w = UnicodeWidthStr::width(span.text.as_str()) as u16;
+            if let Some(link_idx) = span.link_idx {
+                if let Some(link) = self.links.get_mut(link_idx) {
+                    // Only set col_range the first time we see this link
+                    if link.col_range == (0..0) {
+                        link.col_range = col..col + w;
+                        link.line_idx = self.lines.len();
+                    }
+                }
+            }
+            col = col.saturating_add(w);
+        }
+
+        self.push_line(StyledLine { spans, line_type });
     }
 
     fn push_line(&mut self, line: StyledLine) {
         let is_blank = line.spans.is_empty()
             || line.spans.iter().all(|s| s.text.trim().is_empty());
         if is_blank && self.last_was_blank {
-            return; // deduplicate blank lines
+            return;
         }
         self.last_was_blank = is_blank;
         self.lines.push(line);
@@ -127,11 +138,20 @@ impl RenderContext {
         self.inline_spans.push(StyledSpan { text, style, link_idx });
     }
 
+    fn effective_width(&self) -> usize {
+        let indent = self.indent_str().len();
+        (self.col_width as usize).saturating_sub(indent).max(20)
+    }
+
     // ── Walk ─────────────────────────────────────────────────────────────────
 
     fn walk(&mut self, node: &DomNode) {
         match node {
-            DomNode::Document(children) | DomNode::Element(Element { tag: Tag::Html | Tag::Body | Tag::Head, children, .. }) => {
+            DomNode::Document(children) => {
+                for child in children { self.walk(child); }
+            }
+
+            DomNode::Element(Element { tag: Tag::Html | Tag::Body | Tag::Head, children, .. }) => {
                 for child in children { self.walk(child); }
             }
 
@@ -140,21 +160,22 @@ impl RenderContext {
             DomNode::Text(text) => self.walk_text(text),
 
             DomNode::Image(img) => {
-                let line_idx = self.lines.len() + if self.inline_spans.is_empty() { 0 } else { 1 };
                 self.flush_inline();
-                self.lines.push(StyledLine {
+                let display_text = if img.alt.is_empty() {
+                    format!("[IMG: {}]", truncate_url(&img.src, 40))
+                } else {
+                    format!("[IMG: {}]", img.alt)
+                };
+                self.push_line(StyledLine {
                     spans: vec![StyledSpan {
-                        text: if img.alt.is_empty() {
-                            format!("[image: {}]", img.src)
-                        } else {
-                            format!("[{}]", img.alt)
-                        },
-                        style: Style::default().fg(Color::DarkGray),
+                        text: display_text,
+                        style: Style::default().fg(Color::Magenta).add_modifier(Modifier::ITALIC),
                         link_idx: None,
                     }],
                     line_type: LineType::ImagePlaceholder {
                         chafa_output: None,
                         alt: img.alt.clone(),
+                        src: img.src.clone(),
                     },
                 });
             }
@@ -163,17 +184,29 @@ impl RenderContext {
 
     fn walk_text(&mut self, text: &str) {
         if self.in_pre {
-            // Preserve whitespace; split on newlines
+            // Preserve whitespace; split on newlines; truncate long lines
             for (i, line) in text.split('\n').enumerate() {
                 if i > 0 { self.flush_inline(); }
-                self.add_span(line.to_string(), self.current_style(), self.current_link());
+                if line.is_empty() {
+                    self.flush_inline();
+                    continue;
+                }
+                let max = (self.col_width as usize).saturating_sub(1);
+                let display = if UnicodeWidthStr::width(line) > max {
+                    let mut s = truncate_to_width(line, max.saturating_sub(1));
+                    s.push('→');
+                    s
+                } else {
+                    line.to_string()
+                };
+                self.add_span(display, self.current_style(), self.current_link());
             }
         } else {
-            // Word-wrap to col_width
             let indent = self.indent_str();
-            let effective_width = (self.col_width as usize).saturating_sub(indent.len()).max(20);
+            let effective_width = self.effective_width();
             let opts = textwrap::Options::new(effective_width);
             let wrapped = textwrap::wrap(text.trim(), opts);
+
             for (i, line) in wrapped.iter().enumerate() {
                 if i > 0 {
                     self.flush_inline();
@@ -181,11 +214,9 @@ impl RenderContext {
                         self.add_span(indent.clone(), Style::default(), None);
                     }
                 }
-                if i == 0 && !self.inline_spans.is_empty() {
-                    // Append to existing line — just add the span
-                    self.add_span(line.to_string(), self.current_style(), self.current_link());
-                } else {
-                    self.add_span(line.to_string(), self.current_style(), self.current_link());
+                let s = line.to_string();
+                if !s.is_empty() {
+                    self.add_span(s, self.current_style(), self.current_link());
                 }
             }
         }
@@ -193,18 +224,18 @@ impl RenderContext {
 
     fn walk_element(&mut self, el: &Element) {
         match &el.tag {
+
             // ── Stripped ─────────────────────────────────────────────────────
-            Tag::Script | Tag::Style | Tag::Noscript => {}
+            Tag::Script | Tag::Style | Tag::Noscript | Tag::Colgroup | Tag::Col => {}
 
             // ── Line break ───────────────────────────────────────────────────
-            Tag::Br => {
-                self.flush_inline();
-            }
+            Tag::Br => { self.flush_inline(); }
 
             // ── Horizontal rule ──────────────────────────────────────────────
             Tag::Hr => {
                 self.flush_inline();
-                let rule = "─".repeat(self.col_width as usize);
+                let width = (self.col_width as usize).max(1);
+                let rule = "─".repeat(width);
                 self.push_line(StyledLine {
                     spans: vec![StyledSpan {
                         text: rule,
@@ -234,24 +265,28 @@ impl RenderContext {
                 self.pop_style();
                 self.flush_inline();
 
-                // Underline separator for h1/h2
-                if level <= 2 {
-                    let sep_char = if level == 1 { "═" } else { "─" };
-                    let sep = sep_char.repeat(self.col_width as usize);
+                // Underline separators
+                let width = (self.col_width as usize).max(1);
+                let sep = match level {
+                    1 => Some("═".repeat(width)),
+                    2 => Some("─".repeat(width)),
+                    3 => Some("·".repeat(width)),
+                    _ => None,
+                };
+                if let Some(sep_str) = sep {
                     self.push_line(StyledLine {
                         spans: vec![StyledSpan {
-                            text: sep,
+                            text: sep_str,
                             style: Style::default().fg(el.style.color.unwrap_or(Color::DarkGray)),
                             link_idx: None,
                         }],
                         line_type: LineType::Normal,
                     });
                 }
-
                 self.push_blank_lines(el.style.margin_bottom);
             }
 
-            // ── Paragraph / block elements ───────────────────────────────────
+            // ── Paragraph ────────────────────────────────────────────────────
             Tag::P => {
                 self.flush_inline();
                 self.push_blank_lines(1);
@@ -260,26 +295,52 @@ impl RenderContext {
                 self.push_blank_lines(1);
             }
 
+            // ── Generic block containers ──────────────────────────────────────
             Tag::Div | Tag::Section | Tag::Article | Tag::Main
-            | Tag::Nav | Tag::Aside | Tag::Header | Tag::Footer => {
+            | Tag::Nav | Tag::Aside | Tag::Header | Tag::Footer
+            | Tag::Figure => {
                 self.flush_inline();
                 for child in &el.children { self.walk(child); }
                 self.flush_inline();
+            }
+
+            // ── Address ───────────────────────────────────────────────────────
+            Tag::Address => {
+                self.flush_inline();
+                self.push_blank_lines(1);
+                let style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+                self.push_style(style, None);
+                for child in &el.children { self.walk(child); }
+                self.flush_inline();
+                self.pop_style();
+                self.push_blank_lines(1);
             }
 
             // ── Blockquote ───────────────────────────────────────────────────
             Tag::Blockquote => {
                 self.flush_inline();
                 self.push_blank_lines(1);
+
                 let style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
                 self.push_style(style, None);
 
-                // Add a ▌ prefix to each line
-                self.add_span("▌ ".to_string(), style, None);
+                let start_line = self.lines.len();
+
                 for child in &el.children { self.walk(child); }
                 self.flush_inline();
 
                 self.pop_style();
+
+                // Prepend ▌ to every line added in the blockquote
+                let bq_style = Style::default().fg(Color::Cyan);
+                for line in &mut self.lines[start_line..] {
+                    line.spans.insert(0, StyledSpan {
+                        text: "▌ ".to_string(),
+                        style: bq_style,
+                        link_idx: None,
+                    });
+                }
+
                 self.push_blank_lines(1);
             }
 
@@ -302,6 +363,38 @@ impl RenderContext {
                 self.push_style(style, None);
                 for child in &el.children { self.walk(child); }
                 self.pop_style();
+            }
+
+            Tag::Samp => {
+                let style = Style::default().fg(Color::Green);
+                self.push_style(style, None);
+                for child in &el.children { self.walk(child); }
+                self.pop_style();
+            }
+
+            // ── Definition lists ──────────────────────────────────────────────
+            Tag::Dl => {
+                self.flush_inline();
+                self.push_blank_lines(1);
+                for child in &el.children { self.walk(child); }
+                self.flush_inline();
+                self.push_blank_lines(1);
+            }
+
+            Tag::Dt => {
+                self.flush_inline();
+                let style = Style::default().add_modifier(Modifier::BOLD);
+                self.push_style(style, None);
+                for child in &el.children { self.walk(child); }
+                self.flush_inline();
+                self.pop_style();
+            }
+
+            Tag::Dd => {
+                self.flush_inline();
+                self.add_span("  ".to_string(), Style::default(), None);
+                for child in &el.children { self.walk(child); }
+                self.flush_inline();
             }
 
             // ── Lists ────────────────────────────────────────────────────────
@@ -341,7 +434,12 @@ impl RenderContext {
                         format!("{}• ", indent)
                     }
                 } else {
-                    format!("{}• ", indent)
+                    let bullet_char = match self.list_depth {
+                        1 => "•",
+                        2 => "◦",
+                        _ => "▸",
+                    };
+                    format!("{}{} ", indent, bullet_char)
                 };
 
                 self.add_span(bullet, Style::default().fg(Color::Yellow), None);
@@ -351,13 +449,32 @@ impl RenderContext {
                 self.flush_inline();
             }
 
-            // ── Table (basic) ────────────────────────────────────────────────
+            // ── Table ────────────────────────────────────────────────────────
             Tag::Table => {
                 self.flush_inline();
                 self.push_blank_lines(1);
                 for child in &el.children { self.walk(child); }
                 self.flush_inline();
                 self.push_blank_lines(1);
+            }
+
+            Tag::Caption => {
+                self.flush_inline();
+                let style = Style::default().add_modifier(Modifier::BOLD);
+                self.push_style(style, None);
+                for child in &el.children { self.walk(child); }
+                self.flush_inline();
+                self.pop_style();
+                // Separator below caption
+                let width = (self.col_width as usize).max(1);
+                self.push_line(StyledLine {
+                    spans: vec![StyledSpan {
+                        text: "─".repeat(width),
+                        style: Style::default().fg(Color::DarkGray),
+                        link_idx: None,
+                    }],
+                    line_type: LineType::Normal,
+                });
             }
 
             Tag::THead | Tag::TBody | Tag::TFoot => {
@@ -377,7 +494,7 @@ impl RenderContext {
             }
 
             Tag::Th => {
-                let style = Style::default().add_modifier(Modifier::BOLD);
+                let style = Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan);
                 self.push_style(style, None);
                 for child in &el.children { self.walk(child); }
                 self.pop_style();
@@ -387,21 +504,17 @@ impl RenderContext {
             // ── Anchor ───────────────────────────────────────────────────────
             Tag::A => {
                 let href = el.attrs.get("href").cloned().unwrap_or_default();
-                let resolved = if !href.is_empty() {
-                    self.base_url.join(&href).ok()
-                        .map(|u| u.to_string())
-                        .unwrap_or(href.clone())
-                } else {
-                    href.clone()
-                };
+                if href.is_empty() {
+                    for child in &el.children { self.walk(child); }
+                    return;
+                }
 
-                // Register link before walking children (to capture text)
                 let link_idx = self.links.len();
                 self.links.push(PageLink {
                     line_idx: self.lines.len(),
-                    col_range: 0..0,  // updated after render
-                    href: resolved,
-                    text: String::new(), // filled retroactively
+                    col_range: 0..0,
+                    href: href.clone(),
+                    text: String::new(),
                 });
 
                 let style = Style::default()
@@ -412,7 +525,6 @@ impl RenderContext {
                 let span_start = self.inline_spans.len();
                 for child in &el.children { self.walk(child); }
 
-                // Capture link text
                 let link_text: String = self.inline_spans[span_start..]
                     .iter()
                     .map(|s| s.text.as_str())
@@ -420,13 +532,13 @@ impl RenderContext {
                     .join("");
                 if let Some(link) = self.links.get_mut(link_idx) {
                     link.text = link_text;
-                    link.line_idx = self.lines.len();
+                    // line_idx and col_range updated in flush_inline
                 }
 
                 self.pop_style();
             }
 
-            // ── Strong / Em / B / I ──────────────────────────────────────────
+            // ── Inline formatting ─────────────────────────────────────────────
             Tag::Strong | Tag::B => {
                 let style = Style::default().add_modifier(Modifier::BOLD);
                 self.push_style(style, None);
@@ -434,10 +546,133 @@ impl RenderContext {
                 self.pop_style();
             }
 
-            Tag::Em | Tag::I => {
+            Tag::Em | Tag::I | Tag::Cite => {
                 let style = Style::default().add_modifier(Modifier::ITALIC);
                 self.push_style(style, None);
                 for child in &el.children { self.walk(child); }
+                self.pop_style();
+            }
+
+            Tag::Del | Tag::S => {
+                let style = Style::default().add_modifier(Modifier::CROSSED_OUT);
+                self.push_style(style, None);
+                for child in &el.children { self.walk(child); }
+                self.pop_style();
+            }
+
+            Tag::Ins | Tag::U => {
+                let style = Style::default().add_modifier(Modifier::UNDERLINED);
+                self.push_style(style, None);
+                for child in &el.children { self.walk(child); }
+                self.pop_style();
+            }
+
+            Tag::Mark => {
+                let style = Style::default().fg(Color::Black).bg(Color::Yellow);
+                self.push_style(style, None);
+                for child in &el.children { self.walk(child); }
+                self.pop_style();
+            }
+
+            Tag::Small => {
+                let style = Style::default().fg(Color::DarkGray);
+                self.push_style(style, None);
+                for child in &el.children { self.walk(child); }
+                self.pop_style();
+            }
+
+            Tag::Var => {
+                let style = Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC);
+                self.push_style(style, None);
+                for child in &el.children { self.walk(child); }
+                self.pop_style();
+            }
+
+            // ── Keyboard key ──────────────────────────────────────────────────
+            Tag::Kbd => {
+                let style = Style::default()
+                    .fg(Color::White)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD);
+                self.add_span("[".to_string(), style, None);
+                self.push_style(style, None);
+                for child in &el.children { self.walk(child); }
+                self.pop_style();
+                self.add_span("]".to_string(), style, None);
+            }
+
+            // ── Subscript / Superscript ───────────────────────────────────────
+            Tag::Sub => {
+                self.add_span("_".to_string(), self.current_style(), None);
+                for child in &el.children { self.walk(child); }
+            }
+
+            Tag::Sup => {
+                self.add_span("^".to_string(), self.current_style(), None);
+                for child in &el.children { self.walk(child); }
+            }
+
+            // ── Abbreviation ──────────────────────────────────────────────────
+            Tag::Abbr => {
+                for child in &el.children { self.walk(child); }
+                if let Some(title) = el.attrs.get("title") {
+                    let style = Style::default().fg(Color::DarkGray);
+                    self.add_span(format!(" ({})", title), style, None);
+                }
+            }
+
+            // ── Quotation ─────────────────────────────────────────────────────
+            Tag::Q => {
+                self.add_span("\u{201C}".to_string(), self.current_style(), None);
+                for child in &el.children { self.walk(child); }
+                self.add_span("\u{201D}".to_string(), self.current_style(), None);
+            }
+
+            // ── Figure / Figcaption ───────────────────────────────────────────
+            Tag::Figcaption => {
+                self.flush_inline();
+                let style = Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC);
+                self.push_style(style, None);
+                self.add_span("  ↳ ".to_string(), style, None);
+                for child in &el.children { self.walk(child); }
+                self.flush_inline();
+                self.pop_style();
+            }
+
+            // ── Details / Summary ─────────────────────────────────────────────
+            Tag::Details => {
+                self.flush_inline();
+                self.push_blank_lines(1);
+                for child in &el.children { self.walk(child); }
+                self.flush_inline();
+                self.push_blank_lines(1);
+            }
+
+            Tag::Summary => {
+                self.flush_inline();
+                let style = Style::default().add_modifier(Modifier::BOLD);
+                self.add_span("▶ ".to_string(), style, None);
+                self.push_style(style, None);
+                for child in &el.children { self.walk(child); }
+                self.flush_inline();
+                self.pop_style();
+            }
+
+            // ── Time ─────────────────────────────────────────────────────────
+            Tag::Time => {
+                let style = Style::default().add_modifier(Modifier::ITALIC);
+                self.push_style(style, None);
+                for child in &el.children { self.walk(child); }
+                // Append datetime attr if different from displayed text
+                if let Some(dt) = el.attrs.get("datetime") {
+                    let displayed: String = self.inline_spans.iter().map(|s| s.text.as_str()).collect();
+                    if !displayed.trim().contains(dt.as_str()) {
+                        let dim = Style::default().fg(Color::DarkGray);
+                        self.add_span(format!(" ({})", dt), dim, None);
+                    }
+                }
                 self.pop_style();
             }
 
@@ -446,21 +681,37 @@ impl RenderContext {
                 for child in &el.children { self.walk(child); }
             }
 
-            // ── Img (handled in walk() as DomNode::Image) ────────────────────
-            Tag::Img => {}
+            Tag::Img => {} // handled in walk() as DomNode::Image
 
             // ── Remaining block containers ────────────────────────────────────
             _ => {
-                if el.tag.is_block() {
-                    self.flush_inline();
-                }
+                if el.tag.is_block() { self.flush_inline(); }
                 for child in &el.children { self.walk(child); }
-                if el.tag.is_block() {
-                    self.flush_inline();
-                }
+                if el.tag.is_block() { self.flush_inline(); }
             }
         }
     }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Truncate a string to at most `max_width` terminal columns.
+fn truncate_to_width(s: &str, max_width: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+        if w + cw > max_width { break; }
+        out.push(c);
+        w += cw;
+    }
+    out
+}
+
+/// Truncate a URL for display purposes.
+fn truncate_url(url: &str, max: usize) -> &str {
+    if url.len() <= max { url }
+    else { &url[..max] }
 }
 
 #[cfg(test)]
@@ -490,5 +741,34 @@ mod tests {
         let page = render_html(r#"<html><body><a href="/about">About</a></body></html>"#);
         assert!(!page.links.is_empty());
         assert_eq!(page.links[0].text, "About");
+    }
+
+    #[test]
+    fn test_render_del_mark() {
+        let page = render_html("<html><body><del>old</del> <mark>new</mark></body></html>");
+        let all_spans: Vec<_> = page.lines.iter().flat_map(|l| l.spans.iter()).collect();
+        let del_span = all_spans.iter().find(|s| s.text.contains("old")).unwrap();
+        assert!(del_span.style.add_modifier.contains(Modifier::CROSSED_OUT));
+        let mark_span = all_spans.iter().find(|s| s.text.contains("new")).unwrap();
+        assert_eq!(mark_span.style.bg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn test_render_kbd() {
+        let page = render_html("<html><body><kbd>Ctrl+C</kbd></body></html>");
+        let text: String = page.lines.iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(text.contains('[') && text.contains("Ctrl+C") && text.contains(']'));
+    }
+
+    #[test]
+    fn test_link_col_range_set() {
+        let page = render_html(r#"<html><body><a href="/x">Click here</a></body></html>"#);
+        assert!(!page.links.is_empty());
+        let link = &page.links[0];
+        // col_range should not be 0..0 (it was set during flush_inline)
+        assert!(link.col_range.end > 0, "col_range should be set, got {:?}", link.col_range);
     }
 }

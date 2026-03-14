@@ -1,12 +1,14 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget},
 };
 
 use crate::browser::{RenderedPage, StyledLine};
+
+use super::splash::SplashScreen;
 
 pub struct ContentArea<'a> {
     pub page: Option<&'a RenderedPage>,
@@ -19,14 +21,7 @@ impl<'a> Widget for ContentArea<'a> {
         if area.height == 0 { return; }
 
         let Some(page) = self.page else {
-            // Empty state
-            let hint = Line::from(vec![
-                Span::styled("  Press ", Style::default().fg(Color::DarkGray)),
-                Span::styled("o", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(" to open a URL", Style::default().fg(Color::DarkGray)),
-            ]);
-            let para = Paragraph::new(Text::from(vec![hint]));
-            para.render(area, buf);
+            SplashScreen.render(area, buf);
             return;
         };
 
@@ -65,7 +60,6 @@ impl<'a> Widget for ContentArea<'a> {
 fn styled_line_to_ratatui<'a>(line: &'a StyledLine, focused_link: Option<usize>) -> Line<'a> {
     let spans: Vec<Span<'a>> = line.spans.iter().map(|span| {
         let mut style = span.style;
-        // Highlight focused link
         if let (Some(focused), Some(link_idx)) = (focused_link, span.link_idx) {
             if focused == link_idx {
                 style = style.add_modifier(Modifier::REVERSED);

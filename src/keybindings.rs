@@ -51,20 +51,31 @@ pub enum Action {
 /// Maps a crossterm KeyEvent to an Action in Normal mode.
 pub fn map_normal(key: KeyEvent) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    // Ctrl combos first (avoid overlap with bare keys)
+    if ctrl {
+        return match key.code {
+            KeyCode::Char('c') => Some(Action::Quit),
+            KeyCode::Char('h') => Some(Action::PrevTab),
+            KeyCode::Char('l') => Some(Action::NextTab),
+            _ => None,
+        };
+    }
+
     match key.code {
         KeyCode::Char('q') => Some(Action::Quit),
-        KeyCode::Char('c') if ctrl => Some(Action::Quit),
 
-        KeyCode::Char('j') | KeyCode::Down => Some(Action::ScrollDown(1)),
-        KeyCode::Char('k') | KeyCode::Up => Some(Action::ScrollUp(1)),
+        KeyCode::Char('j') | KeyCode::Down  => Some(Action::ScrollDown(1)),
+        KeyCode::Char('k') | KeyCode::Up    => Some(Action::ScrollUp(1)),
         KeyCode::Char('d') => Some(Action::ScrollPageDown),
         KeyCode::Char('u') => Some(Action::ScrollPageUp),
         KeyCode::Char('G') => Some(Action::ScrollBottom),
         // 'g' handled by double-key state machine in app.rs
 
-        KeyCode::Tab => Some(Action::FocusNextLink),
+        KeyCode::Tab     => Some(Action::FocusNextLink),
         KeyCode::BackTab => Some(Action::FocusPrevLink),
-        KeyCode::Enter | KeyCode::Char('l') => Some(Action::FollowLink),
+        KeyCode::Enter   => Some(Action::FollowLink),
+        KeyCode::Char('l') => Some(Action::FollowLink),
 
         KeyCode::Char('H') => Some(Action::GoBack),
         KeyCode::Char('L') => Some(Action::GoForward),
@@ -77,8 +88,6 @@ pub fn map_normal(key: KeyEvent) -> Option<Action> {
 
         KeyCode::Char('t') => Some(Action::NewTab),
         KeyCode::Char('x') => Some(Action::CloseTab),
-        KeyCode::Char('h') if ctrl => Some(Action::PrevTab),
-        // Ctrl+L for next tab handled separately (avoids overlap with FollowLink 'l')
 
         KeyCode::Char(c @ '1'..='9') => {
             Some(Action::SwitchTab(c as usize - '1' as usize))
@@ -98,8 +107,10 @@ pub fn map_input(key: KeyEvent) -> Option<Action> {
         KeyCode::Delete => Some(Action::InputDelete),
         KeyCode::Left => Some(Action::InputLeft),
         KeyCode::Right => Some(Action::InputRight),
-        KeyCode::Home | KeyCode::Char('a') if ctrl => Some(Action::InputHome),
-        KeyCode::End | KeyCode::Char('e') if ctrl => Some(Action::InputEnd),
+        KeyCode::Home => Some(Action::InputHome),
+        KeyCode::End => Some(Action::InputEnd),
+        KeyCode::Char('a') if ctrl => Some(Action::InputHome),
+        KeyCode::Char('e') if ctrl => Some(Action::InputEnd),
         KeyCode::Char('c') if ctrl => Some(Action::Quit),
         KeyCode::Char(c) => Some(Action::InputChar(c)),
         _ => None,

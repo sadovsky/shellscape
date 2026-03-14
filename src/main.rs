@@ -17,6 +17,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 use tracing_appender::rolling;
 use tracing_subscriber::EnvFilter;
+use url::Url;
 
 use app::App;
 
@@ -31,6 +32,13 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    // ── Parse optional URL argument ───────────────────────────────────────────
+    let initial_url: Option<Url> = std::env::args().nth(1).and_then(|arg| {
+        // Try as-is, then prepend https://
+        Url::parse(&arg).ok()
+            .or_else(|| Url::parse(&format!("https://{}", arg)).ok())
+    });
 
     // ── Panic hook: restore terminal before printing ──────────────────────────
     let default_hook = std::panic::take_hook();
@@ -48,7 +56,7 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // ── Run app ───────────────────────────────────────────────────────────────
-    let result = run(&mut terminal).await;
+    let result = run(&mut terminal, initial_url).await;
 
     // ── Terminal teardown ─────────────────────────────────────────────────────
     disable_raw_mode()?;
@@ -62,7 +70,10 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<()> {
-    let mut app = App::new()?;
+async fn run<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    initial_url: Option<Url>,
+) -> Result<()> {
+    let mut app = App::new(initial_url)?;
     app.run(terminal).await
 }

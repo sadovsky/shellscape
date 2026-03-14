@@ -53,10 +53,12 @@ pub struct App {
     pub should_quit: bool,
     pub viewport_width: u16,
     pub viewport_height: u16,
+    /// Optional URL to navigate to on first draw (from CLI argument).
+    initial_url: Option<Url>,
 }
 
 impl App {
-    pub fn new() -> Result<Self> {
+    pub fn new(initial_url: Option<Url>) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let http_client = Arc::new(fetcher::build_client()?);
         let chafa = Arc::new(ChafaRenderer::new());
@@ -75,6 +77,7 @@ impl App {
             should_quit: false,
             viewport_width: 80,
             viewport_height: 24,
+            initial_url,
         })
     }
 
@@ -84,6 +87,11 @@ impl App {
         &mut self,
         terminal: &mut ratatui::Terminal<B>,
     ) -> Result<()> {
+        // If a URL was passed on the command line, navigate immediately
+        if let Some(url) = self.initial_url.take() {
+            self.navigate_to(url);
+        }
+
         let mut term_events = crossterm::event::EventStream::new();
         let mut tick_interval = tokio::time::interval(Duration::from_millis(100));
 
@@ -97,7 +105,6 @@ impl App {
                 }
                 _ = tick_interval.tick() => {
                     self.spinner_tick = self.spinner_tick.wrapping_add(1);
-                    // Force redraw if loading (spinner animation)
                     let tab = self.browser.current_tab();
                     if matches!(tab.load_state, LoadState::Loading { .. }) {
                         self.is_dirty = true;
@@ -107,11 +114,11 @@ impl App {
 
             if self.is_dirty {
                 terminal.draw(|frame| {
-                    self.viewport_width = frame.area().width;
-                    self.viewport_height = frame.area().height;
-                    // Update scroll viewport
-                    let tab = self.browser.current_tab_mut();
-                    tab.scroll.viewport_height = frame.area().height.saturating_sub(3) as usize;
+                    let area = frame.area();
+                    self.viewport_width = area.width;
+                    self.viewport_height = area.height;
+                    let content_h = area.height.saturating_sub(3);
+                    self.browser.current_tab_mut().scroll.viewport_height = content_h as usize;
                     crate::ui::draw(frame, self);
                 })?;
                 self.is_dirty = false;
@@ -132,6 +139,8 @@ impl App {
             Event::Resize(w, h) => {
                 self.viewport_width = w;
                 self.viewport_height = h;
+                // Re-render current page at new width for text reflow
+                self.rerender_page(w);
                 self.is_dirty = true;
             }
             _ => {}
@@ -191,7 +200,7 @@ impl App {
                 self.is_dirty = true;
             }
             AppEvent::TermMouse(mouse) => {
-                use crossterm::event::{MouseEventKind};
+                use crossterm::event::MouseEventKind;
                 match mouse.kind {
                     MouseEventKind::ScrollDown => {
                         self.browser.current_tab_mut().scroll.scroll_down(3);
@@ -266,12 +275,11 @@ impl App {
                         self.input_buffer.clear();
                         self.cursor_pos = 0;
                         if !raw.is_empty() {
-                            let url = normalize_url(&raw);
-                            match url {
+                            match normalize_url(&raw) {
                                 Ok(u) => self.navigate_to(u),
                                 Err(e) => {
                                     self.browser.current_tab_mut().load_state =
-                                        LoadState::Error(e.to_string());
+                                        LoadState::Error(format!("Invalid URL: {}", e));
                                 }
                             }
                         }
@@ -355,40 +363,67 @@ impl App {
         };
 
         let final_url = result.url.clone();
+        let is_history_nav = tab.is_history_nav;
+        tab.is_history_nav = false;
 
         match result.body {
             FetchBody::Html(html) => {
                 let base_url = final_url.clone();
                 let col_width = self.viewport_width.max(40);
 
-                // Parse HTML → DomNode
                 let parsed = parser::parse(&html, &base_url);
                 let title = parsed.title.clone();
 
-                // Render DomNode → StyledLine
                 let mut page = renderer::render(&parsed.root, &base_url, col_width);
                 page.title = title.clone();
                 page.url = final_url.clone();
 
                 let total = page.lines.len();
+
+                // Store DOM for reflow on resize
+                let tab = self.browser.tabs.iter_mut().find(|t| t.id == tab_id).unwrap();
+                tab.dom = Some((parsed.root, base_url.clone()));
                 tab.page = Some(page);
-                tab.title = title;
+                tab.title = title.clone();
                 tab.url = Some(final_url.clone());
                 tab.load_state = LoadState::Idle;
                 tab.scroll.total_lines = total;
                 tab.scroll.offset = 0;
 
-                tab.push_history(final_url, tab.title.clone());
+                if !is_history_nav {
+                    tab.push_history(final_url, title);
+                }
 
                 // Spawn image render tasks
                 self.spawn_image_tasks(tab_id);
             }
             FetchBody::Binary { mime, .. } => {
+                let tab = self.browser.tabs.iter_mut().find(|t| t.id == tab_id).unwrap();
                 tab.load_state = LoadState::Error(
-                    format!("Binary content ({}); cannot display", mime)
+                    format!("Binary content ({}); cannot display in browser", mime)
                 );
                 tab.url = Some(final_url);
             }
+        }
+    }
+
+    /// Re-render the current page at a new terminal width (on resize).
+    fn rerender_page(&mut self, new_width: u16) {
+        let tab = self.browser.current_tab_mut();
+        if let Some((dom, base_url)) = &tab.dom {
+            let col_width = new_width.max(40);
+            let mut page = renderer::render(dom, base_url, col_width);
+            if let Some(existing) = &tab.page {
+                page.title = existing.title.clone();
+                page.focused_link = existing.focused_link;
+            }
+            let total = page.lines.len();
+            tab.scroll.total_lines = total;
+            // Clamp scroll offset to new total
+            if tab.scroll.offset >= total {
+                tab.scroll.offset = total.saturating_sub(1);
+            }
+            tab.page = Some(page);
         }
     }
 
@@ -398,19 +433,35 @@ impl App {
         };
         let Some(page) = &tab.page else { return; };
 
-        let image_lines: Vec<(usize, String)> = page.lines.iter().enumerate()
+        let image_tasks: Vec<(usize, String)> = page.lines.iter().enumerate()
             .filter_map(|(i, line)| {
-                // Image nodes were rendered separately; look for ImagePlaceholder
-                // We need the original src. For now skip — images come from DomNode::Image
-                // which we handle during the render pass. The chafa rendering
-                // would need the original URL; store it in the line_type.
-                // This is a placeholder for the future image download+chafa pipeline.
-                None
+                if let crate::browser::LineType::ImagePlaceholder { src, .. } = &line.line_type {
+                    if !src.is_empty() { Some((i, src.clone())) } else { None }
+                } else {
+                    None
+                }
             })
             .collect();
 
-        // Image rendering is async and requires image URL storage in LineType.
-        // Full implementation done in Phase 8; for now this is a no-op.
+        for (line_idx, src_url) in image_tasks {
+            let Ok(url) = Url::parse(&src_url) else { continue; };
+            let tx = self.event_tx.clone();
+            let client = Arc::clone(&self.http_client);
+            let chafa = Arc::clone(&self.chafa);
+            let col_width = self.viewport_width;
+
+            tokio::spawn(async move {
+                let bytes = match fetcher::fetch_bytes(&client, url).await {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+                let output = chafa.render_image(&bytes, col_width, 10)
+                    .unwrap_or_default();
+                if !output.is_empty() {
+                    let _ = tx.send(AppEvent::ImageRendered { line_idx, tab_id, output });
+                }
+            });
+        }
     }
 
     fn focus_link(&mut self, direction: i32) {
@@ -423,7 +474,6 @@ impl App {
         let next = ((current as i32 + direction).rem_euclid(count)) as usize;
         page.focused_link = Some(next);
 
-        // Scroll to the focused link's line
         let link_line = page.links[next].line_idx;
         if link_line < tab.scroll.offset {
             tab.scroll.offset = link_line;
@@ -453,13 +503,11 @@ impl App {
 }
 
 fn normalize_url(raw: &str) -> anyhow::Result<Url> {
-    // If it already parses with a scheme, use it directly
     if let Ok(u) = Url::parse(raw) {
         if u.scheme() == "http" || u.scheme() == "https" || u.scheme() == "file" {
             return Ok(u);
         }
     }
-    // Prepend https:// and try again
     let with_scheme = format!("https://{}", raw);
     Ok(Url::parse(&with_scheme)?)
 }

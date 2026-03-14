@@ -1,5 +1,6 @@
 pub mod address_bar;
 pub mod content;
+pub mod splash;
 pub mod status_bar;
 pub mod tabs;
 
@@ -44,7 +45,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             url: current_url,
             input: &app.input_buffer,
             cursor_pos: app.cursor_pos,
-            editing: matches!(app.mode, AppMode::AddressBar | AppMode::Search),
+            mode: &app.mode,
         },
         chunks[1],
     );
@@ -63,14 +64,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     // Status bar
     let hint = match app.mode {
-        AppMode::Normal => " o:URL  H/L:back/fwd  t:tab  /:search  q:quit",
-        AppMode::AddressBar => " Enter:go  Esc:cancel",
-        AppMode::Search => " Enter:find  Esc:cancel  n/N:next/prev",
+        AppMode::Normal => "o:URL  H/L:nav  t:tab  /:search  q:quit",
+        AppMode::AddressBar => "Enter:go  Esc:cancel",
+        AppMode::Search => "Enter:find  n/N:next/prev  Esc:cancel",
     };
     frame.render_widget(
         StatusBar {
             load_state: &tab.load_state,
             spinner_tick: app.spinner_tick,
+            can_go_back: tab.can_go_back(),
+            can_go_forward: tab.can_go_forward(),
             mode_hint: hint,
         },
         chunks[3],
