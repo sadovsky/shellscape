@@ -16,17 +16,14 @@ pub struct StyledSpan {
 #[derive(Debug, Clone)]
 pub enum LineType {
     Normal,
-    Heading(u8),
+    Heading,
     HorizontalRule,
-    CodeBlock,
-    BlockQuote,
-    ListItem(u8),
+    ListItem,
     /// A placeholder for an image that may not have been rendered yet.
     /// `image_id` is unique within the page and used to find this line when
     /// the async render task completes — even if prior splices shifted indices.
     ImagePlaceholder {
         image_id: usize,
-        alt: String,
         src: String,
     },
 }
@@ -41,12 +38,7 @@ impl StyledLine {
     pub fn empty() -> Self {
         Self { spans: vec![], line_type: LineType::Normal }
     }
-    pub fn plain(text: impl Into<String>) -> Self {
-        Self {
-            spans: vec![StyledSpan { text: text.into(), style: Style::default(), link_idx: None }],
-            line_type: LineType::Normal,
-        }
-    }
+
 }
 
 // ── Link registry ────────────────────────────────────────────────────────────
@@ -117,7 +109,6 @@ pub enum LoadState {
 #[derive(Debug, Clone)]
 pub struct HistoryEntry {
     pub url: Url,
-    pub title: String,
 }
 
 // ── Tab ───────────────────────────────────────────────────────────────────────
@@ -158,9 +149,9 @@ impl Tab {
     }
 
     /// Push a new entry and advance the pointer. Truncates any forward history.
-    pub fn push_history(&mut self, url: Url, title: String) {
+    pub fn push_history(&mut self, url: Url) {
         self.history.truncate(self.history_idx);
-        self.history.push(HistoryEntry { url, title });
+        self.history.push(HistoryEntry { url });
         self.history_idx = self.history.len();
     }
 
@@ -266,9 +257,9 @@ mod tests {
     #[test]
     fn test_history_push_and_back() {
         let mut tab = Tab::new(0);
-        tab.push_history(make_url("http://a.com"), "A".into());
-        tab.push_history(make_url("http://b.com"), "B".into());
-        tab.push_history(make_url("http://c.com"), "C".into());
+        tab.push_history(make_url("http://a.com"));
+        tab.push_history(make_url("http://b.com"));
+        tab.push_history(make_url("http://c.com"));
 
         assert_eq!(tab.history_idx, 3);
         assert_eq!(tab.go_back().unwrap().as_str(), "http://b.com/");
@@ -281,8 +272,8 @@ mod tests {
     #[test]
     fn test_history_forward() {
         let mut tab = Tab::new(0);
-        tab.push_history(make_url("http://a.com"), "A".into());
-        tab.push_history(make_url("http://b.com"), "B".into());
+        tab.push_history(make_url("http://a.com"));
+        tab.push_history(make_url("http://b.com"));
         tab.go_back();
         assert_eq!(tab.go_forward().unwrap().as_str(), "http://b.com/");
         assert!(tab.go_forward().is_none());
@@ -291,12 +282,12 @@ mod tests {
     #[test]
     fn test_history_truncates_forward_on_new_nav() {
         let mut tab = Tab::new(0);
-        tab.push_history(make_url("http://a.com"), "A".into());
-        tab.push_history(make_url("http://b.com"), "B".into());
-        tab.push_history(make_url("http://c.com"), "C".into());
+        tab.push_history(make_url("http://a.com"));
+        tab.push_history(make_url("http://b.com"));
+        tab.push_history(make_url("http://c.com"));
         tab.go_back(); // now at B
         tab.go_back(); // now at A
-        tab.push_history(make_url("http://d.com"), "D".into());
+        tab.push_history(make_url("http://d.com"));
         // C and B should be gone
         assert_eq!(tab.history.len(), 2);
         assert_eq!(tab.history[1].url.as_str(), "http://d.com/");

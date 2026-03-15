@@ -28,8 +28,6 @@ pub struct ImageNode {
     /// Absolute URL (resolved against base_url during parse)
     pub src: String,
     pub alt: String,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
 }
 
 pub type AttrMap = HashMap<String, String>;
@@ -113,11 +111,6 @@ impl Tag {
 #[derive(Debug, Clone, Default)]
 pub struct ComputedStyle {
     pub color: Option<Color>,
-    pub bg_color: Option<Color>,
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-    pub strikethrough: bool,
     pub margin_top: u16,
     pub margin_bottom: u16,
 }
@@ -125,36 +118,23 @@ pub struct ComputedStyle {
 impl ComputedStyle {
     pub fn for_tag(tag: &Tag) -> Self {
         match tag {
-            Tag::H1 => ComputedStyle { bold: true, margin_top: 1, margin_bottom: 1,
+            Tag::H1 => ComputedStyle { margin_top: 1, margin_bottom: 1,
                 color: Some(Color::Magenta), ..Default::default() },
-            Tag::H2 => ComputedStyle { bold: true, margin_top: 1, margin_bottom: 1,
+            Tag::H2 => ComputedStyle { margin_top: 1, margin_bottom: 1,
                 color: Some(Color::Cyan), ..Default::default() },
-            Tag::H3 => ComputedStyle { bold: true, margin_top: 1, margin_bottom: 0,
+            Tag::H3 => ComputedStyle { margin_top: 1, margin_bottom: 0,
                 color: Some(Color::Yellow), ..Default::default() },
-            Tag::H4 | Tag::H5 | Tag::H6 => ComputedStyle {
-                bold: true, ..Default::default()
-            },
-            Tag::Strong | Tag::B => ComputedStyle { bold: true, ..Default::default() },
-            Tag::Em | Tag::I | Tag::Cite | Tag::Var => ComputedStyle { italic: true, ..Default::default() },
             Tag::Code | Tag::Samp => ComputedStyle { color: Some(Color::Green), ..Default::default() },
             Tag::Pre => ComputedStyle { color: Some(Color::Green), margin_top: 1,
                 margin_bottom: 1, ..Default::default() },
             Tag::Blockquote => ComputedStyle { color: Some(Color::DarkGray),
-                italic: true, margin_top: 1, margin_bottom: 1, ..Default::default() },
-            Tag::A => ComputedStyle { color: Some(Color::Blue),
-                underline: true, ..Default::default() },
+                margin_top: 1, margin_bottom: 1, ..Default::default() },
+            Tag::A => ComputedStyle { color: Some(Color::Blue), ..Default::default() },
             Tag::P => ComputedStyle { margin_bottom: 1, ..Default::default() },
-            Tag::Del | Tag::S => ComputedStyle { strikethrough: true, ..Default::default() },
-            Tag::Ins | Tag::U => ComputedStyle { underline: true, ..Default::default() },
-            Tag::Mark => ComputedStyle { color: Some(Color::Black),
-                bg_color: Some(Color::Yellow), ..Default::default() },
             Tag::Small => ComputedStyle { color: Some(Color::DarkGray), ..Default::default() },
-            Tag::Address => ComputedStyle { italic: true, margin_top: 1, margin_bottom: 1,
+            Tag::Address => ComputedStyle { margin_top: 1, margin_bottom: 1,
                 ..Default::default() },
-            Tag::Figcaption => ComputedStyle { italic: true,
-                color: Some(Color::DarkGray), ..Default::default() },
-            Tag::Summary => ComputedStyle { bold: true, ..Default::default() },
-            Tag::Time => ComputedStyle { italic: true, ..Default::default() },
+            Tag::Figcaption => ComputedStyle { color: Some(Color::DarkGray), ..Default::default() },
             _ => ComputedStyle::default(),
         }
     }
@@ -218,6 +198,21 @@ fn walk_node(handle: &Handle, title: &mut String, base_url: &Url) -> Option<DomN
                 return None;
             }
 
+            // Skip elements that are explicitly hidden from the user.
+            if attrs_map.contains_key("hidden") {
+                return None;
+            }
+            if attrs_map.get("aria-hidden").map(|v| v == "true").unwrap_or(false) {
+                return None;
+            }
+            if let Some(style) = attrs_map.get("style") {
+                // Quick check: remove spaces around colon and look for display:none
+                let compact = style.replace(" ", "").to_lowercase();
+                if compact.contains("display:none") {
+                    return None;
+                }
+            }
+
             if tag_name == "title" {
                 let text = extract_text(handle);
                 if !text.is_empty() {
@@ -230,9 +225,7 @@ fn walk_node(handle: &Handle, title: &mut String, base_url: &Url) -> Option<DomN
                 let raw_src = attrs_map.get("src").cloned().unwrap_or_default();
                 let src = resolve_url(base_url, &raw_src).unwrap_or(raw_src);
                 let alt = attrs_map.get("alt").cloned().unwrap_or_default();
-                let width = attrs_map.get("width").and_then(|w| w.parse::<u32>().ok());
-                let height = attrs_map.get("height").and_then(|h| h.parse::<u32>().ok());
-                return Some(DomNode::Image(ImageNode { src, alt, width, height }));
+                return Some(DomNode::Image(ImageNode { src, alt }));
             }
 
             // Resolve href for anchor tags
@@ -303,6 +296,7 @@ pub fn resolve_url(base: &Url, href: &str) -> Option<String> {
 }
 
 /// Parse a CSS color string into a ratatui Color.
+#[allow(dead_code)]
 pub fn parse_color(s: &str) -> Option<Color> {
     let s = s.trim();
     if let Some(hex) = s.strip_prefix('#') {

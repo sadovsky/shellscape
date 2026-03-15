@@ -1,15 +1,29 @@
 use anyhow::{anyhow, Result};
 use ratatui::style::{Color, Modifier, Style};
 use std::io::Write;
-use std::process::Command;
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Stdio};
 use tempfile::NamedTempFile;
 
 use crate::browser::{LineType, StyledLine, StyledSpan};
+
+// ── Image quality mode ───────────────────────────────────────────────────────
+
+/// Controls how images are rendered via chafa.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum ImageQuality {
+    /// Unicode block/braille characters with full color (default).
+    #[default]
+    Color,
+    /// Classic monochrome ASCII art (`@`, `#`, `.`, etc.).
+    Ascii,
+}
 
 // ── Terminal capabilities ────────────────────────────────────────────────────
 
 /// Detected terminal capabilities relevant to image rendering.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TermCapabilities {
     /// Kitty terminal graphics protocol (pixel-perfect, best quality)
     pub kitty: bool,
@@ -68,12 +82,14 @@ impl TermCapabilities {
 
     /// True when the best available format produces pixel/raster output rather
     /// than Unicode block characters (kitty, iterm2, sixel).
+    #[allow(dead_code)]
     pub fn uses_pixel_format(&self) -> bool {
         self.kitty || self.iterm2 || self.sixel
     }
 
     /// Returns chafa `--format` value and associated colour-quality flags for
     /// the best format this terminal supports.
+    #[allow(dead_code)]
     pub fn chafa_format_flags(&self) -> Vec<String> {
         if self.kitty {
             return vec!["--format".into(), "kitty".into()];
@@ -84,6 +100,23 @@ impl TermCapabilities {
         if self.sixel {
             return vec!["--format".into(), "sixel".into()];
         }
+        self.symbols_format_flags()
+    }
+
+    /// Returns chafa flags for classic monochrome ASCII art rendering
+    /// using the printable ASCII character set with no color.
+    pub fn ascii_format_flags(&self) -> Vec<String> {
+        vec![
+            "--format".into(), "symbols".into(),
+            "--symbols".into(), "ascii".into(),
+            "--colors".into(),  "none".into(),
+        ]
+    }
+
+    /// Returns chafa flags for Unicode block-character (symbols) rendering
+    /// using the best available colour depth. Always produces ANSI output
+    /// that can be parsed and displayed inline via Ratatui.
+    pub fn symbols_format_flags(&self) -> Vec<String> {
         if self.truecolor {
             return vec![
                 "--format".into(), "symbols".into(),
@@ -114,7 +147,12 @@ impl TermCapabilities {
 /// Returns (major, minor) of the installed chafa, or (0, 0) on failure.
 fn detect_chafa_version() -> (u32, u32) {
     (|| -> Option<(u32, u32)> {
-        let out = Command::new("chafa").arg("--version").output().ok()?;
+        let out = Command::new("chafa")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .env_remove("TERM_PROGRAM")
+            .output()
+            .ok()?;
         let s = String::from_utf8_lossy(&out.stdout);
         // Output looks like: "Chafa version 1.12.4"
         for word in s.split_whitespace() {
@@ -170,6 +208,7 @@ impl ChafaRenderer {
         image_bytes: &[u8],
         width_cols: u16,
         height_rows: u16,
+        quality: ImageQuality,
     ) -> Result<Vec<StyledLine>> {
         if !self.available {
             return Err(anyhow!("chafa not available in PATH"));
@@ -182,7 +221,12 @@ impl ChafaRenderer {
 
         let size = format!("{}x{}", width_cols, height_rows);
 
-        let mut args: Vec<String> = self.caps.chafa_format_flags();
+        // Always use symbols mode — pixel formats (kitty/iterm2/sixel) emit binary
+        // escape sequences that Ratatui cannot render inside its cell buffer model.
+        let mut args: Vec<String> = match quality {
+            ImageQuality::Ascii => self.caps.ascii_format_flags(),
+            ImageQuality::Color => self.caps.symbols_format_flags(),
+        };
 
         // Size
         args.extend(["--size".into(), size]);
@@ -190,16 +234,14 @@ impl ChafaRenderer {
         // Disable animation (we just want one frame)
         args.extend(["--animate".into(), "false".into()]);
 
-        if !self.caps.uses_pixel_format() {
-            // Font ratio: terminal cells are typically ~0.5 wide:tall.
-            // This gives correct aspect ratio for images.
-            args.extend(["--font-ratio".into(), "0.5".into()]);
+        // Font ratio: terminal cells are typically ~0.5 wide:tall.
+        args.extend(["--font-ratio".into(), "0.5".into()]);
 
+        if quality == ImageQuality::Color {
             // Maximum quality computation (chafa >= 1.6)
             if self.version >= (1, 6) {
                 args.extend(["--work".into(), "9".into()]);
             }
-
             // Bayer dithering for smoother gradients (chafa >= 1.10)
             if self.version >= (1, 10) {
                 args.extend(["--dither".into(), "bayer".into()]);
@@ -208,7 +250,23 @@ impl ChafaRenderer {
 
         args.push(path);
 
-        let output = Command::new("chafa").args(&args).output()?;
+        // Run chafa fully isolated from the live terminal:
+        // - setsid() in pre_exec creates a new session with no controlling terminal,
+        //   so any attempt by chafa to open /dev/tty (for OSC color queries) fails
+        //   silently — preventing "rgb:xxxx/yyyy/zzzz" garbage from leaking into the TUI
+        // - stdin null as an additional guard against reading terminal responses
+        // - strip terminal-ID env vars so chafa skips pixel-protocol detection
+        let mut cmd = Command::new("chafa");
+        cmd.args(&args)
+            .stdin(Stdio::null())
+            .env("TERM", "xterm-256color")
+            .env_remove("TERM_PROGRAM")
+            .env_remove("COLORTERM")
+            .env_remove("KITTY_WINDOW_ID")
+            .env_remove("TMUX");
+        // SAFETY: setsid() is async-signal-safe; only called in the child after fork.
+        unsafe { cmd.pre_exec(|| { libc::setsid(); Ok(()) }); }
+        let output = cmd.output()?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -216,19 +274,11 @@ impl ChafaRenderer {
         }
 
         let ansi_str = String::from_utf8_lossy(&output.stdout);
-
-        if self.caps.uses_pixel_format() {
-            // Pixel formats (kitty/sixel/iterm) emit binary escape sequences
-            // that bypass Ratatui's cell model. For now return a placeholder.
-            // TODO: implement raw-passthrough rendering.
-            Ok(vec![StyledLine::plain("[image - pixel format not yet rendered inline]")])
+        let lines = parse_ansi_to_lines(&ansi_str);
+        if lines.is_empty() {
+            Err(anyhow!("chafa produced no output"))
         } else {
-            let lines = parse_ansi_to_lines(&ansi_str);
-            if lines.is_empty() {
-                Err(anyhow!("chafa produced no output"))
-            } else {
-                Ok(lines)
-            }
+            Ok(lines)
         }
     }
 }

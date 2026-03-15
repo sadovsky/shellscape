@@ -9,7 +9,7 @@ use url::Url;
 
 use crate::browser::{BrowserState, LoadState};
 use crate::fetcher::{self, FetchBody, FetchResult};
-use crate::image::ChafaRenderer;
+use crate::image::{ChafaRenderer, ImageQuality};
 use crate::keybindings::{self, Action};
 use crate::parser;
 use crate::renderer;
@@ -27,10 +27,7 @@ pub enum AppMode {
 
 #[derive(Debug)]
 pub enum AppEvent {
-    TermKey(KeyEvent),
     TermMouse(MouseEvent),
-    TermResize(u16, u16),
-    Tick,
     FetchComplete { tab_id: usize, result: FetchResult },
     FetchError { tab_id: usize, error: String },
     /// Async image render completed. `image_id` uniquely identifies the
@@ -52,6 +49,8 @@ pub struct App {
     pub last_key: Option<(KeyCode, Instant)>,
     pub http_client: Arc<reqwest::Client>,
     pub chafa: Arc<ChafaRenderer>,
+    pub image_quality: ImageQuality,
+    pub reader_mode: bool,
     pub event_tx: mpsc::UnboundedSender<AppEvent>,
     pub event_rx: mpsc::UnboundedReceiver<AppEvent>,
     pub spinner_tick: usize,
@@ -76,6 +75,8 @@ impl App {
             last_key: None,
             http_client,
             chafa,
+            image_quality: ImageQuality::default(),
+            reader_mode: false,
             event_tx,
             event_rx,
             spinner_tick: 0,
@@ -237,12 +238,6 @@ impl App {
                     _ => {}
                 }
             }
-            AppEvent::TermResize(w, h) => {
-                self.viewport_width = w;
-                self.viewport_height = h;
-                self.is_dirty = true;
-            }
-            AppEvent::TermKey(_) | AppEvent::Tick => {}
         }
     }
 
@@ -358,6 +353,23 @@ impl App {
             Action::NextTab => self.browser.next_tab(),
             Action::PrevTab => self.browser.prev_tab(),
             Action::SwitchTab(i) => self.browser.switch_to(i),
+
+            Action::ToggleImageMode => {
+                self.image_quality = match self.image_quality {
+                    ImageQuality::Color => ImageQuality::Ascii,
+                    ImageQuality::Ascii => ImageQuality::Color,
+                };
+                let tab_id = self.browser.current_tab().id;
+                self.rerender_page(self.viewport_width);
+                self.spawn_image_tasks(tab_id);
+            }
+
+            Action::ToggleReaderMode => {
+                self.reader_mode = !self.reader_mode;
+                let tab_id = self.browser.current_tab().id;
+                self.rerender_page(self.viewport_width);
+                self.spawn_image_tasks(tab_id);
+            }
         }
     }
 
@@ -398,9 +410,33 @@ impl App {
                 let parsed = parser::parse(&html, &base_url);
                 let title = parsed.title.clone();
 
-                let mut page = renderer::render(&parsed.root, &base_url, col_width);
+                let mut page = renderer::render(&parsed.root, &base_url, col_width, self.reader_mode);
                 page.title = title.clone();
                 page.url = final_url.clone();
+
+                // SPA detection: if the page rendered almost no text content,
+                // it likely requires JavaScript to render. Prepend a notice.
+                let text_chars: usize = page.lines.iter()
+                    .flat_map(|l| l.spans.iter())
+                    .map(|s| s.text.trim().len())
+                    .sum();
+                let looks_like_spa = text_chars < 200
+                    && (html.contains("\"react\"") || html.contains("id=\"root\"")
+                        || html.contains("id=\"app\"") || html.contains("ng-version")
+                        || html.contains("data-reactroot") || html.contains("__NEXT_DATA__")
+                        || html.contains("__nuxt"));
+                if looks_like_spa {
+                    use crate::browser::{LineType, StyledLine, StyledSpan};
+                    use ratatui::style::{Color, Style};
+                    page.lines.insert(0, StyledLine {
+                        spans: vec![StyledSpan {
+                            text: "⚠ This page requires JavaScript — content may be missing or incomplete.".to_string(),
+                            style: Style::default().fg(Color::Yellow),
+                            link_idx: None,
+                        }],
+                        line_type: LineType::Normal,
+                    });
+                }
 
                 let total = page.lines.len();
 
@@ -415,13 +451,13 @@ impl App {
                 tab.scroll.offset = 0;
 
                 if !is_history_nav {
-                    tab.push_history(final_url, title);
+                    tab.push_history(final_url);
                 }
 
                 // Spawn image render tasks
                 self.spawn_image_tasks(tab_id);
             }
-            FetchBody::Binary { mime, .. } => {
+            FetchBody::Binary { mime } => {
                 let tab = self.browser.tabs.iter_mut().find(|t| t.id == tab_id).unwrap();
                 tab.load_state = LoadState::Error(
                     format!("Binary content ({}); cannot display in browser", mime)
@@ -436,7 +472,7 @@ impl App {
         let tab = self.browser.current_tab_mut();
         if let Some((dom, base_url)) = &tab.dom {
             let col_width = new_width.max(40);
-            let mut page = renderer::render(dom, base_url, col_width);
+            let mut page = renderer::render(dom, base_url, col_width, self.reader_mode);
             if let Some(existing) = &tab.page {
                 page.title = existing.title.clone();
                 page.focused_link = existing.focused_link;
@@ -473,6 +509,8 @@ impl App {
         // giving a roughly square image. Capped at 40 rows to avoid flooding the page.
         let img_height: u16 = (col_width / 2).min(40).max(10);
 
+        let quality = self.image_quality;
+
         for (image_id, src_url) in image_tasks {
             let Ok(url) = Url::parse(&src_url) else { continue; };
             let tx = self.event_tx.clone();
@@ -484,11 +522,11 @@ impl App {
                     Ok(b) => b,
                     Err(_) => return,
                 };
-                match chafa.render_image(&bytes, col_width, img_height) {
+                match chafa.render_image(&bytes, col_width, img_height, quality) {
                     Ok(lines) if !lines.is_empty() => {
                         let _ = tx.send(AppEvent::ImageRendered { image_id, tab_id, lines });
                     }
-                    _ => {} // silently ignore render failures
+                    _ => {}
                 }
             });
         }

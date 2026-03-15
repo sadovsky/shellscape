@@ -1,6 +1,5 @@
 mod app;
 mod browser;
-mod error;
 mod fetcher;
 mod image;
 mod keybindings;

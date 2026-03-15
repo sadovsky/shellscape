@@ -46,6 +46,8 @@ pub enum Action {
 
     // App
     Quit,
+    ToggleImageMode,
+    ToggleReaderMode,
 }
 
 /// Maps a crossterm KeyEvent to an Action in Normal mode.
@@ -85,6 +87,9 @@ pub fn map_normal(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('/') => Some(Action::SearchStart),
         KeyCode::Char('n') => Some(Action::SearchNext),
         KeyCode::Char('N') => Some(Action::SearchPrev),
+
+        KeyCode::Char('a') => Some(Action::ToggleImageMode),
+        KeyCode::Char('R') => Some(Action::ToggleReaderMode),
 
         KeyCode::Char('t') => Some(Action::NewTab),
         KeyCode::Char('x') => Some(Action::CloseTab),
