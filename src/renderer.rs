@@ -7,8 +7,8 @@ use crate::parser::{DomNode, Element, Tag};
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
-pub fn render(root: &DomNode, base_url: &Url, col_width: u16) -> RenderedPage {
-    let mut ctx = RenderContext::new(col_width, base_url.clone());
+pub fn render(root: &DomNode, base_url: &Url, col_width: u16, reader_mode: bool) -> RenderedPage {
+    let mut ctx = RenderContext::new(col_width, reader_mode);
     ctx.walk(root);
     ctx.flush_inline();
 
@@ -25,7 +25,7 @@ pub fn render(root: &DomNode, base_url: &Url, col_width: u16) -> RenderedPage {
 
 struct RenderContext {
     col_width: u16,
-    base_url: Url,
+    reader_mode: bool,
 
     lines: Vec<StyledLine>,
     links: Vec<PageLink>,
@@ -53,10 +53,10 @@ struct StyleFrame {
 }
 
 impl RenderContext {
-    fn new(col_width: u16, base_url: Url) -> Self {
+    fn new(col_width: u16, reader_mode: bool) -> Self {
         Self {
             col_width,
-            base_url,
+            reader_mode,
             lines: Vec::new(),
             links: Vec::new(),
             inline_spans: Vec::new(),
@@ -132,6 +132,22 @@ impl RenderContext {
         }
     }
 
+    /// Push a dim `── Label ──────` separator line.
+    fn push_section_label(&mut self, label: &str, color: Color) {
+        let width = self.col_width as usize;
+        let prefix = format!("── {} ", label);
+        let dashes = "─".repeat(width.saturating_sub(prefix.chars().count()));
+        let text = format!("{}{}", prefix, dashes);
+        self.push_line(StyledLine {
+            spans: vec![StyledSpan {
+                text,
+                style: Style::default().fg(color),
+                link_idx: None,
+            }],
+            line_type: LineType::Normal,
+        });
+    }
+
     fn indent_str(&self) -> String {
         "  ".repeat(self.list_depth as usize)
     }
@@ -179,7 +195,6 @@ impl RenderContext {
                     }],
                     line_type: LineType::ImagePlaceholder {
                         image_id,
-                        alt: img.alt.clone(),
                         src: img.src.clone(),
                     },
                 });
@@ -264,7 +279,7 @@ impl RenderContext {
                     .add_modifier(Modifier::BOLD)
                     .fg(el.style.color.unwrap_or(Color::White));
 
-                self.current_line_type = LineType::Heading(level);
+                self.current_line_type = LineType::Heading;
                 self.push_style(style, None);
                 for child in &el.children { self.walk(child); }
                 self.pop_style();
@@ -300,10 +315,93 @@ impl RenderContext {
                 self.push_blank_lines(1);
             }
 
+            // ── Landmark sections ─────────────────────────────────────────────
+            Tag::Nav => {
+                self.flush_inline();
+                if self.reader_mode {
+                    // Skip navigation entirely in reader mode
+                } else {
+                    self.push_blank_lines(1);
+                    self.push_section_label("Navigation", Color::DarkGray);
+                    let style = Style::default().fg(Color::DarkGray);
+                    self.push_style(style, None);
+                    for child in &el.children { self.walk(child); }
+                    self.flush_inline();
+                    self.pop_style();
+                    self.push_blank_lines(1);
+                }
+            }
+
+            Tag::Header => {
+                self.flush_inline();
+                if self.reader_mode {
+                    // Skip header in reader mode
+                } else {
+                    self.push_blank_lines(1);
+                    self.push_section_label("Header", Color::DarkGray);
+                    let style = Style::default().fg(Color::DarkGray);
+                    self.push_style(style, None);
+                    for child in &el.children { self.walk(child); }
+                    self.flush_inline();
+                    self.pop_style();
+                    self.push_blank_lines(1);
+                }
+            }
+
+            Tag::Footer => {
+                self.flush_inline();
+                if self.reader_mode {
+                    // Skip footer in reader mode
+                } else {
+                    self.push_blank_lines(1);
+                    self.push_section_label("Footer", Color::DarkGray);
+                    let style = Style::default().fg(Color::DarkGray);
+                    self.push_style(style, None);
+                    for child in &el.children { self.walk(child); }
+                    self.flush_inline();
+                    self.pop_style();
+                    self.push_blank_lines(1);
+                }
+            }
+
+            Tag::Aside => {
+                self.flush_inline();
+                if self.reader_mode {
+                    // Skip asides in reader mode
+                } else {
+                    self.push_blank_lines(1);
+                    let style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+                    self.push_style(style, None);
+                    let start_line = self.lines.len();
+                    for child in &el.children { self.walk(child); }
+                    self.flush_inline();
+                    self.pop_style();
+                    // Prefix each aside line with a sidebar marker
+                    let aside_style = Style::default().fg(Color::DarkGray);
+                    for line in &mut self.lines[start_line..] {
+                        line.spans.insert(0, StyledSpan {
+                            text: "│ ".to_string(),
+                            style: aside_style,
+                            link_idx: None,
+                        });
+                    }
+                    self.push_blank_lines(1);
+                }
+            }
+
+            Tag::Main => {
+                // Always render <main>; in reader mode add a subtle marker so
+                // the user knows they're in the primary content region.
+                self.flush_inline();
+                if self.reader_mode {
+                    self.push_section_label("Main Content", Color::Cyan);
+                }
+                for child in &el.children { self.walk(child); }
+                self.flush_inline();
+            }
+
             // ── Generic block containers ──────────────────────────────────────
-            Tag::Div | Tag::Section | Tag::Article | Tag::Main
-            | Tag::Nav | Tag::Aside | Tag::Header | Tag::Footer
-            | Tag::Figure => {
+            Tag::Div | Tag::Section | Tag::Article | Tag::Figure => {
                 self.flush_inline();
                 for child in &el.children { self.walk(child); }
                 self.flush_inline();
@@ -448,7 +546,7 @@ impl RenderContext {
                 };
 
                 self.add_span(bullet, Style::default().fg(Color::Yellow), None);
-                self.current_line_type = LineType::ListItem(self.list_depth);
+                self.current_line_type = LineType::ListItem;
 
                 for child in &el.children { self.walk(child); }
                 self.flush_inline();
@@ -530,7 +628,9 @@ impl RenderContext {
                 let span_start = self.inline_spans.len();
                 for child in &el.children { self.walk(child); }
 
-                let link_text: String = self.inline_spans[span_start..]
+                let link_text: String = self.inline_spans
+                    .get(span_start..)
+                    .unwrap_or(&[])
                     .iter()
                     .map(|s| s.text.as_str())
                     .collect::<Vec<_>>()
@@ -727,14 +827,14 @@ mod tests {
     fn render_html(html: &str) -> RenderedPage {
         let base = Url::parse("http://example.com").unwrap();
         let parsed = parser::parse(html, &base);
-        render(&parsed.root, &base, 80)
+        render(&parsed.root, &base, 80, false)
     }
 
     #[test]
     fn test_render_heading() {
         let page = render_html("<html><body><h1>Hello World</h1></body></html>");
         let heading_lines: Vec<_> = page.lines.iter()
-            .filter(|l| matches!(l.line_type, LineType::Heading(1)))
+            .filter(|l| matches!(l.line_type, LineType::Heading))
             .collect();
         assert!(!heading_lines.is_empty());
         let text: String = heading_lines[0].spans.iter().map(|s| s.text.as_str()).collect();

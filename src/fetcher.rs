@@ -5,15 +5,13 @@ use url::Url;
 #[derive(Debug)]
 pub struct FetchResult {
     pub url: Url,
-    pub status: u16,
-    pub content_type: String,
     pub body: FetchBody,
 }
 
 #[derive(Debug)]
 pub enum FetchBody {
     Html(String),
-    Binary { mime: String, bytes: Vec<u8> },
+    Binary { mime: String },
 }
 
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MB
@@ -27,7 +25,6 @@ pub async fn fetch(client: &Client, url: Url) -> Result<FetchResult> {
         .send()
         .await?;
 
-    let status = response.status().as_u16();
     let final_url = Url::parse(response.url().as_str())?;
 
     let content_type = response
@@ -49,13 +46,10 @@ pub async fn fetch(client: &Client, url: Url) -> Result<FetchResult> {
         let text = String::from_utf8_lossy(&bytes).into_owned();
         FetchBody::Html(text)
     } else {
-        FetchBody::Binary {
-            mime: content_type.clone(),
-            bytes: bytes.to_vec(),
-        }
+        FetchBody::Binary { mime: content_type }
     };
 
-    Ok(FetchResult { url: final_url, status, content_type, body })
+    Ok(FetchResult { url: final_url, body })
 }
 
 pub async fn fetch_bytes(client: &Client, url: Url) -> Result<Vec<u8>> {

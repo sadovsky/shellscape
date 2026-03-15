@@ -1487,6 +1487,7 @@ dependencies = [
  "crossterm",
  "futures",
  "html5ever",
+ "libc",
  "markup5ever_rcdom",
  "mime",
  "ratatui",

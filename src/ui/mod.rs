@@ -63,8 +63,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
     );
 
     // Status bar
+    let reader_tag = if app.reader_mode { "  [READER]" } else { "" };
+    let normal_hint = format!("o:URL  H/L:nav  R:reader  a:ascii  q:quit{}", reader_tag);
     let hint = match app.mode {
-        AppMode::Normal => "o:URL  H/L:nav  t:tab  /:search  q:quit",
+        AppMode::Normal => normal_hint.as_str(),
         AppMode::AddressBar => "Enter:go  Esc:cancel",
         AppMode::Search => "Enter:find  n/N:next/prev  Esc:cancel",
     };
